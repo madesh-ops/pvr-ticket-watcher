@@ -2,11 +2,16 @@ name: PVR ticket watcher
 
 on:
   workflow_dispatch:
+    inputs:
+      test:
+        description: "One quick check + Telegram test message, then stop"
+        type: boolean
+        default: false
   schedule:
     - cron: "*/30 * * * *"   # backup trigger; queued runs start as soon as the current one ends
 
 concurrency:
-  group: pvr-watcher
+  group: pvr-watcher-${{ inputs.test && 'test' || 'main' }}
   cancel-in-progress: false
 
 permissions:
@@ -26,7 +31,17 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Quick test
+        if: inputs.test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PVR_MOVIES: ${{ vars.PVR_MOVIES || 'AVENGERS' }}
+          PVR_DATES: ${{ vars.PVR_DATES }}
+        run: python pvr_watcher.py --test
+
       - name: Restore already-alerted shows
+        if: ${{ !inputs.test }}
         uses: actions/cache/restore@v4
         with:
           path: pvr_seen.json
@@ -34,6 +49,7 @@ jobs:
           restore-keys: pvr-seen-
 
       - name: Watch PVR (~5h50m)
+        if: ${{ !inputs.test }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -44,14 +60,14 @@ jobs:
         run: python pvr_watcher.py
 
       - name: Save already-alerted shows
-        if: always()
+        if: ${{ always() && !inputs.test }}
         uses: actions/cache/save@v4
         with:
           path: pvr_seen.json
           key: pvr-seen-${{ github.run_id }}
 
       - name: Hand off to the next run
-        if: success()
+        if: ${{ success() && !inputs.test }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run watch.yml --repo "${{ github.repository }}"
