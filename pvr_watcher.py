@@ -24,6 +24,14 @@ from pathlib import Path
 
 import requests
 
+# Load KEY=VALUE lines from a local .env (git-ignored) without overriding real env vars.
+_env = Path(__file__).with_name(".env")
+if _env.exists():
+    for _line in _env.read_text(encoding="utf-8").splitlines():
+        if "=" in _line and not _line.lstrip().startswith("#"):
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 # ----------------------------- CONFIG -----------------------------------------
 CITY = "Chennai"
 

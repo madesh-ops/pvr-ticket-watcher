@@ -1,2 +1,4 @@
 pvr_seen.json
 __pycache__/
+.env
+*.log
