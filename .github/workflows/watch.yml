@@ -1,0 +1,57 @@
+name: PVR ticket watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # backup trigger; queued runs start as soon as the current one ends
+
+concurrency:
+  group: pvr-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore already-alerted shows
+        uses: actions/cache/restore@v4
+        with:
+          path: pvr_seen.json
+          key: pvr-seen-${{ github.run_id }}
+          restore-keys: pvr-seen-
+
+      - name: Watch PVR (~5h50m)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PVR_MOVIES: ${{ vars.PVR_MOVIES || 'AVENGERS' }}
+          PVR_DATES: ${{ vars.PVR_DATES }}
+          PVR_POLL_SECONDS: "60"
+          PVR_MAX_RUNTIME: "20700"
+        run: python pvr_watcher.py
+
+      - name: Save already-alerted shows
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: pvr_seen.json
+          key: pvr-seen-${{ github.run_id }}
+
+      - name: Hand off to the next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch.yml --repo "${{ github.repository }}"
