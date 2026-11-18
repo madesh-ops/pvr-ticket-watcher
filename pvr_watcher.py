@@ -1,5 +1,5 @@
 """
-PVR ticket watcher -> Telegram alerts.
+PVR + District ticket watcher -> Telegram alerts.
 
 Polls PVR's showtimes API for the configured cinemas, keeps only 2D shows
 (drops 3D / 3D IMAX / 4DX) for the movies you care about, and pings you on
@@ -15,10 +15,11 @@ Setup:
 
 import argparse
 import json
+import re
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -44,6 +45,14 @@ POLL_SECONDS = int(os.environ.get("PVR_POLL_SECONDS", "60"))
 
 # Stop after this many seconds (0 = forever). GitHub Actions jobs max out at 6h.
 MAX_RUNTIME = int(os.environ.get("PVR_MAX_RUNTIME", "0"))
+
+# District (district.in) movie page for your city. Empty = skip District.
+DISTRICT_URL = os.environ.get(
+    "DISTRICT_URL",
+    "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-chennai-MV176735")
+# Cinema-name keywords to match on District (case-insensitive).
+DISTRICT_CINEMAS = [c.strip().upper() for c in os.environ.get(
+    "DISTRICT_CINEMAS", "NEXUS VIJAYA,PHOENIX").split(",") if c.strip()]
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -74,6 +83,10 @@ except Exception:
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+district_session = requests.Session()
+district_session.headers.update({"User-Agent": HEADERS["User-Agent"],
+                                 "Accept": "text/html", "Accept-Language": "en-IN,en"})
 
 
 def log(msg):
@@ -120,6 +133,8 @@ def parse_shows(cid, output):
                     continue  # already started
                 yield {
                     "key": f"{cid}:{sh.get('sessionId')}",
+                    "source": "PVR",
+                    "link": "https://www.pvrcinemas.com/",
                     "cinema": CINEMAS.get(cid, cid),
                     "movie": name,
                     "date": sh.get("showDate"),
@@ -130,7 +145,82 @@ def parse_shows(cid, output):
                 }
 
 
+def district_page(fmt=None, date=None):
+    """Fetch a District movie page and return the JSON state Next.js embeds in it."""
+    params = {}
+    if fmt:
+        params = {"frmtid": fmt.lower(), "fromdate": date}
+    r = district_session.get(DISTRICT_URL, params=params, timeout=30)
+    r.raise_for_status()
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+    if not m:
+        raise RuntimeError("District page layout changed (no __NEXT_DATA__)")
+    return json.loads(m.group(1))["props"]["pageProps"]["data"]["serverState"]
+
+
+def check_district():
+    state = district_page()
+    content = next(iter((state.get("movieContents") or {}).values()), {})
+    movie = content.get("name", "?")
+    shows = []
+    for grp in content.get("languageFormatGroups") or []:
+        fmt, lang = grp["fmtGrpId"], grp.get("language", "")
+        dates = None
+        todo = DATES[:] if DATES else [None]
+        while todo:
+            dt = todo.pop(0)
+            st = district_page(fmt, dt or datetime.now().strftime("%Y-%m-%d"))
+            for key, ms in (st.get("movieSessions") or {}).items():
+                if dates is None and not DATES:  # discover open dates from the first page
+                    dates = (ms.get("data") or {}).get("sessionDates") or []
+                    todo = [d for d in dates if d != ms.get("searchDate")]
+                page = ms.get("pageData") or {}
+                for cin in (page.get("nearbyCinemas") or []) + (page.get("farCinemas") or []):
+                    name = (cin.get("cinemaInfo") or {}).get("name") or cin.get("name", "")
+                    if DISTRICT_CINEMAS and not any(k in name.upper() for k in DISTRICT_CINEMAS):
+                        continue
+                    for s in cin.get("sessions") or []:
+                        scrn = str(s.get("scrnFmt") or "")
+                        if any(m in scrn.upper() for m in NON_2D_MARKERS):
+                            continue
+                        status = str(s.get("seatStatus") or "")
+                        if not s.get("avail") or s.get("disableClick") or "SOLD" in status.upper():
+                            continue
+                        # showTime is UTC -> IST
+                        t = datetime.fromisoformat(s["showTime"]) + timedelta(hours=5, minutes=30)
+                        if t < datetime.utcnow() + timedelta(hours=5, minutes=30):
+                            continue
+                        shows.append({
+                            "key": f"district:{s.get('encSessionId') or s.get('sid')}",
+                            "source": "District",
+                            "link": f"{DISTRICT_URL}?frmtid={fmt.lower()}&fromdate={t:%Y-%m-%d}",
+                            "cinema": name,
+                            "movie": f"{movie} ({lang})",
+                            "date": f"{t:%Y-%m-%d}",
+                            "time": f"{t:%I:%M %p}",
+                            "screen": s.get("audi"),
+                            "exp": scrn or "2D",
+                            "status": status or "Available",
+                        })
+            time.sleep(0.5)
+    return shows
+
+
 def check_all():
+    shows, errors = [], []
+    sources = [("PVR", check_pvr)] + ([("District", check_district)] if DISTRICT_URL else [])
+    for name, fn in sources:
+        try:
+            shows.extend(fn())
+        except Exception as e:
+            log(f"{name} check failed: {e}")
+            errors.append(f"{name}: {e}")
+    if len(errors) == len(sources):
+        raise RuntimeError("; ".join(errors))
+    return list({s["key"]: s for s in shows}.values())  # drop duplicates
+
+
+def check_pvr():
     shows = []
     for cid in CINEMAS:
         if DATES:  # fast path: dated calls are ~0.1s, the "NA" discovery call can take ~40s
@@ -165,14 +255,13 @@ def telegram(text):
 
 
 def format_alert(new):
-    lines = ["🎬 <b>PVR 2D tickets available!</b>"]
+    lines = ["🎬 <b>2D tickets available!</b>"]
     by_group = {}
     for s in new:
-        by_group.setdefault((s["movie"], s["cinema"], s["date"]), []).append(s)
-    for (movie, cinema, date), items in sorted(by_group.items(), key=lambda kv: kv[0][2]):
+        by_group.setdefault((s["date"], s["source"], s["movie"], s["cinema"], s["link"]), []).append(s)
+    for (date, source, movie, cinema, link), items in sorted(by_group.items()):
         times = ", ".join(f"{s['time']} ({s['screen']}, {s['exp']}, {s['status']})" for s in items)
-        lines.append(f"\n<b>{movie}</b>\n📍 {cinema}\n📅 {date}\n🕒 {times}")
-    lines.append("\nBook: https://www.pvrcinemas.com/")
+        lines.append(f"\n<b>{movie}</b>\n📍 {cinema}\n📅 {date}\n🕒 {times}\n🔗 {source}: {link}")
     return "\n".join(lines)[:4000]
 
 
